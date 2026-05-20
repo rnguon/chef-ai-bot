@@ -1,5 +1,7 @@
 .env
 ingredients.json
+recipes.json
+recipes/
 __pycache__/
 *.pyc
 .venv/
