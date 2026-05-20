@@ -4,6 +4,7 @@ import anthropic
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,6 +13,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 INGREDIENTS_FILE = Path(__file__).parent / "ingredients.json"
+RECIPES_FILE = Path(__file__).parent / "recipes.json"
 
 SYSTEM_PROMPT = """You are ChefAI, a friendly and knowledgeable culinary assistant on Discord. You specialize in:
 - Recipe recommendations based on available ingredients
@@ -21,6 +23,10 @@ SYSTEM_PROMPT = """You are ChefAI, a friendly and knowledgeable culinary assista
 
 Keep responses concise and Discord-friendly (use emojis and markdown formatting). When suggesting recipes, be specific with quantities and steps. Always be encouraging and enthusiastic about cooking!"""
 
+
+# ---------------------------------------------------------------------------
+# Ingredient storage helpers
+# ---------------------------------------------------------------------------
 
 def load_ingredients() -> dict:
     if INGREDIENTS_FILE.exists():
@@ -33,6 +39,30 @@ def save_ingredients(data: dict) -> None:
     with open(INGREDIENTS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+
+# ---------------------------------------------------------------------------
+# Recipe DB helpers
+# ---------------------------------------------------------------------------
+
+def load_recipes() -> dict:
+    if RECIPES_FILE.exists():
+        with open(RECIPES_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_recipes(data: dict) -> None:
+    with open(RECIPES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_user_recipes(user_id: str) -> dict:
+    return load_recipes().get(user_id, {})
+
+
+# ---------------------------------------------------------------------------
+# Bot setup
+# ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -68,6 +98,10 @@ async def send_long(ctx_or_channel, text: str, reply_to=None) -> None:
             await channel.send(chunk)
 
 
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
+
 @bot.event
 async def on_ready():
     print(f"🍳 ChefAI is online as {bot.user} (ID: {bot.user.id})")
@@ -91,6 +125,10 @@ async def on_message(message: discord.Message):
             return
     await bot.process_commands(message)
 
+
+# ---------------------------------------------------------------------------
+# Commands — Pantry management
+# ---------------------------------------------------------------------------
 
 @bot.command(name="add")
 async def add_ingredient(ctx: commands.Context, *, ingredients: str):
@@ -151,6 +189,10 @@ async def list_pantry(ctx: commands.Context):
     await ctx.reply(f"🧺 **Your Pantry** ({len(items)} items):\n{bullet_list}")
 
 
+# ---------------------------------------------------------------------------
+# Commands — AI-powered cooking
+# ---------------------------------------------------------------------------
+
 @bot.command(name="recipe")
 async def recipe(ctx: commands.Context, *, dish: str = None):
     data = load_ingredients()
@@ -203,6 +245,122 @@ async def meal_plan(ctx: commands.Context, days: int = 3):
         await send_long(ctx, reply, reply_to=ctx.message)
 
 
+# ---------------------------------------------------------------------------
+# Commands — Recipe database
+# ---------------------------------------------------------------------------
+
+@bot.command(name="saverecipe")
+async def save_recipe(ctx: commands.Context, *, dish: str):
+    """Generate and save a recipe to your favorites by dish name."""
+    async with ctx.typing():
+        prompt = (f"Give me a complete recipe for **{dish}** with: "
+                  "a short description, full ingredient list with quantities, and numbered step-by-step instructions.")
+        recipe_text = ask_claude(prompt, max_tokens=1500)
+
+    data = load_recipes()
+    user_id = str(ctx.author.id)
+    data.setdefault(user_id, {})
+
+    key = dish.lower().strip()
+    data[user_id][key] = {
+        "name": dish,
+        "content": recipe_text,
+        "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+    }
+    save_recipes(data)
+
+    await ctx.reply(f"❤️ Saved **{dish}** to your recipe favorites!\n\n{recipe_text[:800]}{'...' if len(recipe_text) > 800 else ''}")
+
+
+@bot.command(name="favorites")
+async def list_favorites(ctx: commands.Context):
+    """List all your saved favorite recipes."""
+    user_id = str(ctx.author.id)
+    recipes = get_user_recipes(user_id)
+
+    if not recipes:
+        await ctx.reply("📖 You have no saved recipes yet! Use `!saverecipe <dish>` to save one.")
+        return
+
+    lines = [f"📖 **Your Favorite Recipes** ({len(recipes)} saved):\n"]
+    for i, (key, r) in enumerate(recipes.items(), 1):
+        lines.append(f"`{i}.` **{r['name']}** — saved {r['saved_at']}")
+    lines.append("\n*Use `!getrecipe <name>` to view a recipe.*")
+    await ctx.reply("\n".join(lines))
+
+
+@bot.command(name="getrecipe")
+async def get_recipe(ctx: commands.Context, *, dish: str):
+    """Retrieve a saved recipe from your favorites."""
+    user_id = str(ctx.author.id)
+    recipes = get_user_recipes(user_id)
+    key = dish.lower().strip()
+
+    # Exact match first, then partial
+    match = recipes.get(key)
+    if not match:
+        for k, v in recipes.items():
+            if dish.lower() in k:
+                match = v
+                break
+
+    if not match:
+        await ctx.reply(f"❌ **{dish}** not found in your favorites. Use `!favorites` to see your saved recipes.")
+        return
+
+    await send_long(ctx, f"📖 **{match['name']}**\n*Saved: {match['saved_at']}*\n\n{match['content']}", reply_to=ctx.message)
+
+
+@bot.command(name="deleterecipe")
+async def delete_recipe(ctx: commands.Context, *, dish: str):
+    """Delete a recipe from your favorites."""
+    data = load_recipes()
+    user_id = str(ctx.author.id)
+    recipes = data.get(user_id, {})
+    key = dish.lower().strip()
+
+    # Exact match first, then partial
+    match_key = key if key in recipes else next((k for k in recipes if dish.lower() in k), None)
+
+    if not match_key:
+        await ctx.reply(f"❌ **{dish}** not found in your favorites.")
+        return
+
+    name = recipes[match_key]["name"]
+    del recipes[match_key]
+    data[user_id] = recipes
+    save_recipes(data)
+    await ctx.reply(f"🗑️ Removed **{name}** from your favorites.")
+
+
+@bot.command(name="searchrecipe")
+async def search_recipe(ctx: commands.Context, *, keyword: str):
+    """Search your saved recipes by keyword or ingredient."""
+    user_id = str(ctx.author.id)
+    recipes = get_user_recipes(user_id)
+
+    if not recipes:
+        await ctx.reply("📖 You have no saved recipes yet!")
+        return
+
+    kw = keyword.lower()
+    matches = [(k, v) for k, v in recipes.items() if kw in v["content"].lower() or kw in k]
+
+    if not matches:
+        await ctx.reply(f"🔍 No recipes found containing **{keyword}**.")
+        return
+
+    lines = [f"🔍 **Recipes matching '{keyword}'** ({len(matches)} found):\n"]
+    for key, r in matches:
+        lines.append(f"• **{r['name']}** — saved {r['saved_at']}")
+    lines.append("\n*Use `!getrecipe <name>` to view a recipe.*")
+    await ctx.reply("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Help command
+# ---------------------------------------------------------------------------
+
 @bot.command(name="chefhelp")
 async def chef_help(ctx: commands.Context):
     embed = discord.Embed(
@@ -227,9 +385,22 @@ async def chef_help(ctx: commands.Context):
                "`!chef <question>` — Ask anything about cooking"),
         inline=False,
     )
+    embed.add_field(
+        name="❤️ Favorite Recipes",
+        value=("`!saverecipe <dish>` — Generate & save a recipe\n"
+               "`!favorites` — List all saved recipes\n"
+               "`!getrecipe <name>` — View a saved recipe\n"
+               "`!searchrecipe <keyword>` — Search recipes by ingredient/keyword\n"
+               "`!deleterecipe <name>` — Remove a saved recipe"),
+        inline=False,
+    )
     embed.set_footer(text="Powered by Claude AI 🤖")
     await ctx.reply(embed=embed)
 
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
