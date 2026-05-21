@@ -5,7 +5,7 @@ import json
 import os
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,13 +25,41 @@ SYSTEM_PROMPT = """You are ChefAI, a friendly and knowledgeable culinary assista
 
 Keep responses concise and Discord-friendly (use emojis and markdown formatting). When suggesting recipes, be specific with quantities and steps. Always be encouraging and enthusiastic about cooking!"""
 
+RECIPE_SCHEMA_PROMPT = """
+Return ONLY a valid JSON object (no markdown code blocks, no extra text) for the recipe with these exact fields:
+{
+  "id": "<slug-based-id>",
+  "title": "<dish name>",
+  "description": "<1-2 sentence description>",
+  "author": "<discord_username>",
+  "tags": ["<tag1>", "<tag2>", "..."],
+  "servings": <number>,
+  "prep_time_minutes": <number>,
+  "cook_time_minutes": <number>,
+  "ingredients": [
+    { "name": "<ingredient>", "quantity": <number>, "unit": "<unit>" }
+  ],
+  "instructions": [
+    "<step 1>",
+    "<step 2>"
+  ],
+  "nutrition": {
+    "calories": <number>,
+    "protein_g": <number>,
+    "fat_g": <number>,
+    "carbs_g": <number>
+  },
+  "created_at": "<ISO8601 datetime>",
+  "updated_at": "<ISO8601 datetime>"
+}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def slugify(name: str) -> str:
-    """Convert a recipe name to a filename-safe slug."""
     slug = name.lower().strip()
     slug = re.sub(r'[^\w\s-]', '', slug)
     slug = re.sub(r'[\s_-]+', '_', slug)
@@ -50,8 +78,8 @@ def save_ingredients(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
-def load_recipes() -> dict:
-    """Load the recipe index (metadata only)."""
+def load_recipe_index() -> dict:
+    """Load the lightweight recipe index (name, tags, ingredients, file ref)."""
     if RECIPES_FILE.exists():
         with open(RECIPES_FILE) as f:
             return json.load(f)
@@ -64,15 +92,67 @@ def save_recipe_index(data: dict) -> None:
 
 
 def get_user_recipes(user_id: str) -> dict:
-    return load_recipes().get(user_id, {})
+    return load_recipe_index().get(user_id, {})
 
 
-def read_recipe_file(file_path: str) -> str | None:
-    """Read the full recipe markdown from disk."""
+def read_recipe_file(file_path: str) -> dict | None:
+    """Read a recipe JSON file and return parsed dict."""
     path = Path(__file__).parent / file_path
     if path.exists():
-        return path.read_text(encoding="utf-8")
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     return None
+
+
+def format_recipe_for_discord(r: dict) -> str:
+    """Format a recipe JSON dict into a readable Discord message."""
+    lines = []
+
+    lines.append(f"# {r.get('title', 'Recipe')}")
+    if r.get('description'):
+        lines.append(f"*{r['description']}*")
+    lines.append("")
+
+    meta = []
+    if r.get('servings'):
+        meta.append(f"🏆 Serves {r['servings']}")
+    if r.get('prep_time_minutes'):
+        meta.append(f"⏲️ Prep {r['prep_time_minutes']}m")
+    if r.get('cook_time_minutes'):
+        meta.append(f"🔥 Cook {r['cook_time_minutes']}m")
+    if meta:
+        lines.append("  ".join(meta))
+
+    if r.get('tags'):
+        lines.append("🏷️ " + " ".join(f"`{t}`" for t in r['tags']))
+    lines.append("")
+
+    if r.get('ingredients'):
+        lines.append("**🧺 Ingredients**")
+        for ing in r['ingredients']:
+            qty = ing.get('quantity', '')
+            unit = ing.get('unit', '')
+            name = ing.get('name', '')
+            lines.append(f"• {qty} {unit} {name}".strip())
+    lines.append("")
+
+    if r.get('instructions'):
+        lines.append("**📝 Instructions**")
+        for i, step in enumerate(r['instructions'], 1):
+            lines.append(f"`{i}.` {step}")
+    lines.append("")
+
+    nutrition = r.get('nutrition', {})
+    if any(nutrition.values()):
+        lines.append("**📊 Nutrition (per serving)**")
+        lines.append(
+            f"Calories: {nutrition.get('calories', '?')} • "
+            f"Protein: {nutrition.get('protein_g', '?')}g • "
+            f"Fat: {nutrition.get('fat_g', '?')}g • "
+            f"Carbs: {nutrition.get('carbs_g', '?')}g"
+        )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -267,56 +347,60 @@ async def meal_plan(ctx: commands.Context, days: int = 3):
 
 @bot.command(name="saverecipe")
 async def save_recipe(ctx: commands.Context, *, dish: str):
-    """Generate and save a recipe as a markdown file; index it in recipes.json."""
+    """Generate and save a recipe as a structured JSON file."""
+    user_id = str(ctx.author.id)
+    slug = slugify(dish)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     async with ctx.typing():
         prompt = (
-            f'Generate a complete recipe for "{dish}". '
-            'Return ONLY a valid JSON object with these exact keys (no markdown code blocks):\n'
-            '- "markdown": the full recipe in markdown with # Title, ## Description, ## Ingredients, ## Instructions sections\n'
-            '- "ingredients": list of main ingredient names only (no quantities)\n'
-            '- "tags": list of 3-5 tags (cuisine, protein, meal type, diet, etc.)\n\n'
-            'Example: {"markdown": "# Pasta\\n...", "ingredients": ["pasta", "garlic"], "tags": ["italian", "dinner"]}'
+            f'Generate a recipe for "{dish}" by {ctx.author.display_name}.\n'
+            f'Use id "{slug}", author "{ctx.author.display_name}", '
+            f'created_at and updated_at "{now}".\n'
+            + RECIPE_SCHEMA_PROMPT
         )
         raw = ask_claude(prompt, max_tokens=2000)
 
-    # Parse JSON from Claude response
+    # Parse JSON
     try:
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         recipe_data = json.loads(json_match.group()) if json_match else {}
     except (json.JSONDecodeError, AttributeError):
         recipe_data = {}
 
-    markdown = recipe_data.get("markdown") or raw
-    ingredients = recipe_data.get("ingredients", [])
-    tags = recipe_data.get("tags", [])
+    if not recipe_data.get("title"):
+        await ctx.reply("⚠️ Failed to generate a valid recipe. Please try again.")
+        return
 
-    # Save markdown file to recipes/{user_id}/{slug}.md
-    user_id = str(ctx.author.id)
-    slug = slugify(dish)
+    # Save recipe JSON file
     user_dir = RECIPES_DIR / user_id
     user_dir.mkdir(parents=True, exist_ok=True)
+    relative_path = f"recipes/{user_id}/{slug}.json"
+    (Path(__file__).parent / relative_path).write_text(
+        json.dumps(recipe_data, indent=2), encoding="utf-8"
+    )
 
-    relative_path = f"recipes/{user_id}/{slug}.md"
-    (Path(__file__).parent / relative_path).write_text(markdown, encoding="utf-8")
-
-    # Update index in recipes.json
-    index = load_recipes()
+    # Update lightweight index
+    index = load_recipe_index()
     index.setdefault(user_id, {})
     index[user_id][slug] = {
-        "name": dish,
-        "tags": tags,
-        "ingredients": ingredients,
+        "name": recipe_data.get("title", dish),
+        "tags": recipe_data.get("tags", []),
+        "ingredients": [i["name"] for i in recipe_data.get("ingredients", [])],
         "file": relative_path,
-        "saved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "saved_at": now,
     }
     save_recipe_index(index)
 
-    tags_str = " ".join(f"`{t}`" for t in tags) or "none"
-    ing_preview = ", ".join(ingredients[:6]) + (" ..." if len(ingredients) > 6 else "")
+    tags_str = " ".join(f"`{t}`" for t in recipe_data.get("tags", [])) or "none"
+    ing_preview = ", ".join(i["name"] for i in recipe_data.get("ingredients", [])[:5])
+    total_time = recipe_data.get("prep_time_minutes", 0) + recipe_data.get("cook_time_minutes", 0)
+
     await ctx.reply(
-        f"❤️ **{dish}** saved to your favorites!\n"
+        f"❤️ **{recipe_data['title']}** saved!\n"
         f"🏷️ Tags: {tags_str}\n"
-        f"🧺 Key ingredients: {ing_preview or 'see recipe'}\n"
+        f"⏱️ Total time: {total_time} min  🏆 Serves {recipe_data.get('servings', '?')}\n"
+        f"🧺 Key ingredients: {ing_preview}\n"
         f"📄 File: `{relative_path}`\n\n"
         f"*Use `!getrecipe {dish}` to view the full recipe.*"
     )
@@ -341,32 +425,30 @@ async def list_favorites(ctx: commands.Context):
 
 @bot.command(name="getrecipe")
 async def get_recipe(ctx: commands.Context, *, dish: str):
-    """Retrieve a full recipe from its markdown file."""
+    """Retrieve and display a saved recipe from its JSON file."""
     user_id = str(ctx.author.id)
     recipes = get_user_recipes(user_id)
     key = slugify(dish)
 
-    # Exact slug match, then partial
     entry = recipes.get(key) or next(
         (v for k, v in recipes.items() if dish.lower() in k), None
     )
-
     if not entry:
         await ctx.reply(f"❌ **{dish}** not found. Use `!favorites` to see your saved recipes.")
         return
 
-    content = read_recipe_file(entry["file"])
-    if not content:
-        await ctx.reply(f"⚠️ Recipe file missing for **{entry['name']}**. Try saving it again with `!saverecipe {entry['name']}`.")
+    recipe_data = read_recipe_file(entry["file"])
+    if not recipe_data:
+        await ctx.reply(f"⚠️ Recipe file missing for **{entry['name']}**. Try `!saverecipe {entry['name']}` again.")
         return
 
-    await send_long(ctx, content, reply_to=ctx.message)
+    await send_long(ctx, format_recipe_for_discord(recipe_data), reply_to=ctx.message)
 
 
 @bot.command(name="deleterecipe")
 async def delete_recipe(ctx: commands.Context, *, dish: str):
-    """Delete a recipe's markdown file and remove it from the index."""
-    index = load_recipes()
+    """Delete a recipe JSON file and remove it from the index."""
+    index = load_recipe_index()
     user_id = str(ctx.author.id)
     recipes = index.get(user_id, {})
     key = slugify(dish)
@@ -382,7 +464,6 @@ async def delete_recipe(ctx: commands.Context, *, dish: str):
     index[user_id] = recipes
     save_recipe_index(index)
 
-    # Delete the markdown file
     file_path = Path(__file__).parent / entry["file"]
     if file_path.exists():
         file_path.unlink()
@@ -392,7 +473,7 @@ async def delete_recipe(ctx: commands.Context, *, dish: str):
 
 @bot.command(name="searchrecipe")
 async def search_recipe(ctx: commands.Context, *, keyword: str):
-    """Search saved recipes by ingredient, tag, or keyword (searches index + file content)."""
+    """Search saved recipes by ingredient, tag, or keyword."""
     user_id = str(ctx.author.id)
     recipes = get_user_recipes(user_id)
     if not recipes:
@@ -405,7 +486,9 @@ async def search_recipe(ctx: commands.Context, *, keyword: str):
         in_name = kw in r["name"].lower()
         in_tags = any(kw in t.lower() for t in r.get("tags", []))
         in_ingredients = any(kw in i.lower() for i in r.get("ingredients", []))
-        in_file = kw in (read_recipe_file(r["file"]) or "").lower()
+        # Also search full JSON file content
+        file_data = read_recipe_file(r["file"])
+        in_file = kw in json.dumps(file_data).lower() if file_data else False
         if in_name or in_tags or in_ingredients or in_file:
             matches.append(r)
 
@@ -452,7 +535,7 @@ async def chef_help(ctx: commands.Context):
     )
     embed.add_field(
         name="❤️ Favorite Recipes",
-        value=("`!saverecipe <dish>` — Generate & save a recipe\n"
+        value=("`!saverecipe <dish>` — Generate & save a recipe as JSON\n"
                "`!favorites` — List all saved recipes with tags\n"
                "`!getrecipe <name>` — View a full saved recipe\n"
                "`!searchrecipe <keyword>` — Search by ingredient, tag, or keyword\n"
